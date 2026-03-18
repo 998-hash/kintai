@@ -1,0 +1,673 @@
+/**
+ * 勤務CSV集計ツール
+ *
+ * 使い方:
+ * 1. 「取込」シートに勤務実績CSVを貼り付ける
+ * 2. 「単価マスタ」シートに カレンダ名 / 勤務区分名 / 時給 を設定する
+ * 3. runPayrollAggregation() を実行する
+ */
+function runPayrollAggregation() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var timezone = spreadsheet.getSpreadsheetTimeZone() || Session.getScriptTimeZone() || 'Asia/Tokyo';
+  var importRequiredHeaders = [
+    '個人コード',
+    '氏名',
+    '処理年月日',
+    'カレンダ名',
+    '勤務区分名',
+    '所定時間',
+    '所定内残業',
+    '残業時間'
+  ];
+
+  var importSheet = spreadsheet.getSheetByName('取込');
+  var rateSheet = spreadsheet.getSheetByName('単価マスタ');
+
+  if (!importSheet) {
+    throw new Error('「取込」シートが見つかりません。');
+  }
+  if (!rateSheet) {
+    throw new Error('「単価マスタ」シートが見つかりません。');
+  }
+
+  var importValues = importSheet.getDataRange().getValues();
+  if (importValues.length === 0) {
+    throw new Error('「取込」シートにヘッダ行がありません。');
+  }
+
+  var importHeaderMap = getHeaderMap_(importValues[0], '取込', importRequiredHeaders);
+  validateRequiredHeaders_(importHeaderMap, importRequiredHeaders, '取込');
+
+  var rateMap = loadRateMaster(rateSheet);
+  var detailedResult = buildDetailedResults(importValues.slice(1), importHeaderMap, rateMap, timezone);
+  var monthlySummary = buildMonthlySummary(detailedResult.detailObjects);
+
+  writeTable_(
+    spreadsheet,
+    '集計結果',
+    detailedResult.detailHeaders,
+    detailedResult.detailRows,
+    [14, 15, 16]
+  );
+  writeTable_(
+    spreadsheet,
+    '日別集約',
+    detailedResult.dailyHeaders,
+    detailedResult.dailyRows,
+    [7]
+  );
+  writeTable_(
+    spreadsheet,
+    '月次集計',
+    monthlySummary.headers,
+    monthlySummary.rows,
+    [8]
+  );
+
+  Logger.log(
+    '集計完了: 集計結果 %s 行, 日別集約 %s 行, 月次集計 %s 行',
+    detailedResult.detailRows.length,
+    detailedResult.dailyRows.length,
+    monthlySummary.rows.length
+  );
+}
+
+function loadRateMaster(rateSheet) {
+  var requiredHeaders = ['カレンダ名', '勤務区分名', '時給'];
+  var values = rateSheet.getDataRange().getValues();
+  if (values.length === 0) {
+    throw new Error('「単価マスタ」シートにヘッダ行がありません。');
+  }
+
+  var headerMap = getHeaderMap_(values[0], '単価マスタ', requiredHeaders);
+  validateRequiredHeaders_(headerMap, requiredHeaders, '単価マスタ');
+
+  var rateMap = {};
+  for (var i = 1; i < values.length; i += 1) {
+    var row = values[i];
+    if (isBlankRow_(row)) {
+      continue;
+    }
+
+    var calendarName = normalizeText_(row[headerMap['カレンダ名']]);
+    var workTypeName = normalizeText_(row[headerMap['勤務区分名']]);
+    var hourlyRate = toNumber_(row[headerMap['時給']]);
+
+    if (!calendarName || !workTypeName || hourlyRate === null) {
+      throw new Error('「単価マスタ」シート ' + (i + 1) + ' 行目に未設定項目があります。');
+    }
+
+    rateMap[buildRateKey_(calendarName, workTypeName)] = hourlyRate;
+  }
+
+  return rateMap;
+}
+
+function timeToMinutes(value) {
+  if (value === '' || value === null || typeof value === 'undefined') {
+    return 0;
+  }
+
+  if (typeof value === 'number' && isFinite(value)) {
+    return numericTimeToMinutes_(value);
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return value.getHours() * 60 + value.getMinutes() + Math.round(value.getSeconds() / 60);
+  }
+
+  var text = normalizeText_(value).replace(/：/g, ':');
+  if (!text) {
+    return 0;
+  }
+
+  var timeMatch = text.match(/^(-?\d+):(\d{1,2})(?::(\d{1,2}))?$/);
+  if (timeMatch) {
+    var sign = Number(timeMatch[1]) < 0 ? -1 : 1;
+    var hours = Math.abs(Number(timeMatch[1]));
+    var minutes = Number(timeMatch[2]);
+    var seconds = timeMatch[3] ? Number(timeMatch[3]) : 0;
+    return sign * (hours * 60 + minutes + Math.round(seconds / 60));
+  }
+
+  var numericValue = toNumber_(text);
+  if (numericValue !== null) {
+    return numericTimeToMinutes_(numericValue);
+  }
+
+  throw new Error('時刻形式を解釈できません: ' + value);
+}
+
+function minutesToTimeString(minutes) {
+  var sign = minutes < 0 ? '-' : '';
+  var absoluteMinutes = Math.abs(Math.round(minutes));
+  var hours = Math.floor(absoluteMinutes / 60);
+  var remainMinutes = absoluteMinutes % 60;
+  return sign + hours + ':' + ('0' + remainMinutes).slice(-2);
+}
+
+function groupRowsByEmployeeDate(rows) {
+  var groups = [];
+  var groupMap = {};
+
+  rows.forEach(function(row) {
+    var key = [row.personalCode, row.employeeName, row.dateKey].join('||');
+    if (!groupMap[key]) {
+      groupMap[key] = {
+        personalCode: row.personalCode,
+        employeeName: row.employeeName,
+        dateKey: row.dateKey,
+        dateDisplay: row.dateDisplay,
+        rows: [],
+        firstRowIndex: row.csvOrder
+      };
+      groups.push(groupMap[key]);
+    }
+    groupMap[key].rows.push(row);
+  });
+
+  groups.sort(function(a, b) {
+    return a.firstRowIndex - b.firstRowIndex;
+  });
+
+  groups.forEach(function(group) {
+    group.rows.sort(function(a, b) {
+      return a.csvOrder - b.csvOrder;
+    });
+  });
+
+  return groups;
+}
+
+function allocateDailyBaseAndOvertime(rows) {
+  var remainingBaseMinutes = 480;
+
+  return rows.map(function(row) {
+    var basePayMinutes = Math.max(Math.min(row.rowMinutes, remainingBaseMinutes), 0);
+    var premiumPayMinutes = row.rowMinutes - basePayMinutes;
+    remainingBaseMinutes = Math.max(remainingBaseMinutes - basePayMinutes, 0);
+
+    return Object.assign({}, row, {
+      basePayMinutes: basePayMinutes,
+      premiumPayMinutes: premiumPayMinutes
+    });
+  });
+}
+
+function buildDetailedResults(rawRows, headerMap, rateMap, timezone) {
+  var parsedRows = [];
+
+  rawRows.forEach(function(rawRow, index) {
+    if (isBlankRow_(rawRow)) {
+      return;
+    }
+
+    var personalCode = normalizeText_(rawRow[headerMap['個人コード']]);
+    var employeeName = normalizeText_(rawRow[headerMap['氏名']]);
+    var dateValue = rawRow[headerMap['処理年月日']];
+    var parsedDate = parseSheetDate_(dateValue);
+
+    if (!personalCode) {
+      throw new Error('「取込」シート ' + (index + 2) + ' 行目の個人コードが空です。');
+    }
+    if (!employeeName) {
+      throw new Error('「取込」シート ' + (index + 2) + ' 行目の氏名が空です。');
+    }
+    if (!parsedDate) {
+      throw new Error('「取込」シート ' + (index + 2) + ' 行目の処理年月日を解釈できません。');
+    }
+
+    var prescribedMinutes = timeToMinutes(rawRow[headerMap['所定時間']]);
+    var scheduledOvertimeMinutes = timeToMinutes(rawRow[headerMap['所定内残業']]);
+    var overtimeMinutes = timeToMinutes(rawRow[headerMap['残業時間']]);
+    var rowMinutes = prescribedMinutes + scheduledOvertimeMinutes + overtimeMinutes;
+
+    parsedRows.push({
+      csvOrder: index,
+      sourceRowNumber: index + 2,
+      personalCode: personalCode,
+      employeeName: employeeName,
+      dateKey: Utilities.formatDate(parsedDate, timezone, 'yyyy-MM-dd'),
+      dateDisplay: Utilities.formatDate(parsedDate, timezone, 'yyyy/MM/dd'),
+      monthKey: Utilities.formatDate(parsedDate, timezone, 'yyyy/MM'),
+      calendarName: normalizeText_(rawRow[headerMap['カレンダ名']]),
+      workTypeName: normalizeText_(rawRow[headerMap['勤務区分名']]),
+      prescribedMinutes: prescribedMinutes,
+      scheduledOvertimeMinutes: scheduledOvertimeMinutes,
+      overtimeMinutes: overtimeMinutes,
+      rowMinutes: rowMinutes
+    });
+  });
+
+  var groups = groupRowsByEmployeeDate(parsedRows);
+  var detailHeaders = [
+    'CSV行',
+    '個人コード',
+    '氏名',
+    '処理年月日',
+    'カレンダ名',
+    '勤務区分名',
+    '所定時間',
+    '所定内残業',
+    '残業時間',
+    '行時間',
+    '時給',
+    '行通常時間',
+    '行割増時間',
+    '通常金額',
+    '割増金額',
+    '合計金額',
+    'エラー'
+  ];
+  var dailyHeaders = [
+    '個人コード',
+    '氏名',
+    '処理年月日',
+    '日合計時間',
+    '日通常時間',
+    '日割増時間',
+    '日金額合計',
+    'エラー件数',
+    'エラー内容'
+  ];
+  var detailRows = [];
+  var detailObjects = [];
+  var dailyRows = [];
+
+  groups.forEach(function(group) {
+    var allocatedRows = allocateDailyBaseAndOvertime(group.rows);
+    var dayTotalMinutes = 0;
+    var dayBaseMinutes = 0;
+    var dayPremiumMinutes = 0;
+    var dayTotalAmount = 0;
+    var dayErrors = [];
+
+    allocatedRows.forEach(function(row) {
+      var rateKey = buildRateKey_(row.calendarName, row.workTypeName);
+      var hasRate = Object.prototype.hasOwnProperty.call(rateMap, rateKey);
+      var hourlyRate = hasRate ? rateMap[rateKey] : '';
+      var errorMessage = hasRate
+        ? ''
+        : '単価未登録: カレンダ名=' + row.calendarName + ', 勤務区分名=' + row.workTypeName;
+      var baseAmount = hasRate ? roundCurrency_((row.basePayMinutes / 60) * hourlyRate) : '';
+      var premiumAmount = hasRate ? roundCurrency_((row.premiumPayMinutes / 60) * hourlyRate * 1.25) : '';
+      var totalAmount = hasRate ? roundCurrency_(baseAmount + premiumAmount) : '';
+
+      detailRows.push([
+        row.sourceRowNumber,
+        row.personalCode,
+        row.employeeName,
+        row.dateDisplay,
+        row.calendarName,
+        row.workTypeName,
+        minutesToTimeString(row.prescribedMinutes),
+        minutesToTimeString(row.scheduledOvertimeMinutes),
+        minutesToTimeString(row.overtimeMinutes),
+        minutesToTimeString(row.rowMinutes),
+        hourlyRate,
+        minutesToTimeString(row.basePayMinutes),
+        minutesToTimeString(row.premiumPayMinutes),
+        baseAmount,
+        premiumAmount,
+        totalAmount,
+        errorMessage
+      ]);
+
+      detailObjects.push({
+        personalCode: row.personalCode,
+        employeeName: row.employeeName,
+        dateKey: row.dateKey,
+        monthKey: row.monthKey,
+        rowMinutes: row.rowMinutes,
+        basePayMinutes: row.basePayMinutes,
+        premiumPayMinutes: row.premiumPayMinutes,
+        totalAmount: hasRate ? totalAmount : 0,
+        hasError: !hasRate
+      });
+
+      dayTotalMinutes += row.rowMinutes;
+      dayBaseMinutes += row.basePayMinutes;
+      dayPremiumMinutes += row.premiumPayMinutes;
+      if (hasRate) {
+        dayTotalAmount += totalAmount;
+      } else {
+        dayErrors.push(errorMessage);
+      }
+    });
+
+    dailyRows.push([
+      group.personalCode,
+      group.employeeName,
+      group.dateDisplay,
+      minutesToTimeString(dayTotalMinutes),
+      minutesToTimeString(dayBaseMinutes),
+      minutesToTimeString(dayPremiumMinutes),
+      roundCurrency_(dayTotalAmount),
+      dayErrors.length,
+      dayErrors.join(' | ')
+    ]);
+  });
+
+  return {
+    detailHeaders: detailHeaders,
+    detailRows: detailRows,
+    detailObjects: detailObjects,
+    dailyHeaders: dailyHeaders,
+    dailyRows: dailyRows
+  };
+}
+
+function buildMonthlySummary(detailObjects) {
+  var monthlyMap = {};
+  var monthlyList = [];
+
+  detailObjects.forEach(function(row) {
+    var key = [row.monthKey, row.personalCode, row.employeeName].join('||');
+    if (!monthlyMap[key]) {
+      monthlyMap[key] = {
+        monthKey: row.monthKey,
+        personalCode: row.personalCode,
+        employeeName: row.employeeName,
+        workDateMap: {},
+        totalMinutes: 0,
+        basePayMinutes: 0,
+        premiumPayMinutes: 0,
+        totalAmount: 0,
+        errorCount: 0
+      };
+      monthlyList.push(monthlyMap[key]);
+    }
+
+    monthlyMap[key].workDateMap[row.dateKey] = true;
+    monthlyMap[key].totalMinutes += row.rowMinutes;
+    monthlyMap[key].basePayMinutes += row.basePayMinutes;
+    monthlyMap[key].premiumPayMinutes += row.premiumPayMinutes;
+    monthlyMap[key].totalAmount += row.totalAmount;
+    monthlyMap[key].errorCount += row.hasError ? 1 : 0;
+  });
+
+  monthlyList.sort(function(a, b) {
+    if (a.monthKey !== b.monthKey) {
+      return a.monthKey < b.monthKey ? -1 : 1;
+    }
+    if (a.personalCode !== b.personalCode) {
+      return a.personalCode < b.personalCode ? -1 : 1;
+    }
+    return a.employeeName < b.employeeName ? -1 : (a.employeeName > b.employeeName ? 1 : 0);
+  });
+
+  return {
+    headers: [
+      '対象年月',
+      '個人コード',
+      '氏名',
+      '勤務日数',
+      '月合計時間',
+      '月通常時間',
+      '月割増時間',
+      '月金額合計',
+      'エラー件数'
+    ],
+    rows: monthlyList.map(function(item) {
+      return [
+        item.monthKey,
+        item.personalCode,
+        item.employeeName,
+        Object.keys(item.workDateMap).length,
+        minutesToTimeString(item.totalMinutes),
+        minutesToTimeString(item.basePayMinutes),
+        minutesToTimeString(item.premiumPayMinutes),
+        roundCurrency_(item.totalAmount),
+        item.errorCount
+      ];
+    })
+  };
+}
+
+function getHeaderMap_(headers, sheetName, requiredHeaders) {
+  var normalizedHeaderIndexMap = {};
+  headers.forEach(function(header, index) {
+    var name = normalizeHeaderName_(header);
+    if (name) {
+      if (!normalizedHeaderIndexMap[name]) {
+        normalizedHeaderIndexMap[name] = [];
+      }
+      normalizedHeaderIndexMap[name].push(index);
+    }
+  });
+
+  if (!requiredHeaders || requiredHeaders.length === 0) {
+    return normalizedHeaderIndexMap;
+  }
+
+  var resolvedHeaderMap = {
+    __availableHeaders: headers
+      .map(function(header) {
+        return normalizeText_(header);
+      })
+      .filter(function(header) {
+        return header !== '';
+      })
+  };
+
+  requiredHeaders.forEach(function(requiredHeader) {
+    var resolvedIndex = resolveHeaderIndex_(requiredHeader, normalizedHeaderIndexMap);
+    if (resolvedIndex !== null) {
+      resolvedHeaderMap[requiredHeader] = resolvedIndex;
+    }
+  });
+
+  return resolvedHeaderMap;
+}
+
+function validateRequiredHeaders_(headerMap, requiredHeaders, sheetName) {
+  var missingHeaders = requiredHeaders.filter(function(header) {
+    return !Object.prototype.hasOwnProperty.call(headerMap, header);
+  });
+
+  if (missingHeaders.length > 0) {
+    var availableHeaders = headerMap.__availableHeaders || [];
+    var detail = availableHeaders.length > 0
+      ? ' / 検出ヘッダ: ' + availableHeaders.join(', ')
+      : '';
+    throw new Error('「' + sheetName + '」シートに必要なヘッダがありません: ' + missingHeaders.join(', ') + detail);
+  }
+}
+
+function writeTable_(spreadsheet, sheetName, headers, rows, amountColumns) {
+  var sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(sheetName);
+  }
+
+  sheet.clearContents();
+  sheet.clearFormats();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+    amountColumns.forEach(function(columnIndex) {
+      sheet.getRange(2, columnIndex, rows.length, 1).setNumberFormat('#,##0.00');
+    });
+  }
+
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, headers.length);
+}
+
+function parseSheetDate_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+  }
+
+  if (typeof value === 'number' && isFinite(value)) {
+    var numericText = String(Math.trunc(value));
+    if (/^\d{8}$/.test(numericText)) {
+      return buildDateFromParts_(
+        Number(numericText.slice(0, 4)),
+        Number(numericText.slice(4, 6)),
+        Number(numericText.slice(6, 8))
+      );
+    }
+
+    var epochTime = Date.UTC(1899, 11, 30) + Math.round(value * 24 * 60 * 60 * 1000);
+    var serialDate = new Date(epochTime);
+    return new Date(serialDate.getUTCFullYear(), serialDate.getUTCMonth(), serialDate.getUTCDate());
+  }
+
+  var text = normalizeText_(value);
+  if (!text) {
+    return null;
+  }
+
+  var normalized = text
+    .replace(/年/g, '/')
+    .replace(/月/g, '/')
+    .replace(/日/g, '')
+    .replace(/[.]/g, '/')
+    .replace(/-/g, '/')
+    .split(/[ T]/)[0];
+
+  var match = normalized.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (match) {
+    return buildDateFromParts_(Number(match[1]), Number(match[2]), Number(match[3]));
+  }
+
+  var compact = normalized.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (compact) {
+    return buildDateFromParts_(Number(compact[1]), Number(compact[2]), Number(compact[3]));
+  }
+
+  var parsed = new Date(text);
+  if (!isNaN(parsed.getTime())) {
+    return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+  }
+
+  return null;
+}
+
+function buildDateFromParts_(year, month, day) {
+  var date = new Date(year, month - 1, day);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return null;
+  }
+  return date;
+}
+
+function buildRateKey_(calendarName, workTypeName) {
+  return calendarName + '||' + workTypeName;
+}
+
+function getHeaderAliases_(headerName) {
+  var aliases = {
+    '個人コード': ['個人コード', '社員コード', '職員コード', '従業員コード', 'スタッフコード'],
+    '氏名': ['氏名', '社員名', '職員名', '従業員名', 'スタッフ名', '姓名', '氏 名'],
+    '処理年月日': ['処理年月日', '勤務日', '日付', '対象日', '処理日'],
+    'カレンダ名': ['カレンダ名', 'カレンダー名'],
+    '勤務区分名': ['勤務区分名', '勤務区分', '勤怠区分名', '勤怠区分'],
+    '所定時間': ['所定時間'],
+    '所定内残業': ['所定内残業', '所定内残業時間'],
+    '残業時間': ['残業時間', '法定外残業時間'],
+    '時給': ['時給', '単価', '時間単価']
+  };
+
+  return (aliases[headerName] || [headerName]).map(function(alias) {
+    return normalizeHeaderName_(alias);
+  });
+}
+
+function resolveHeaderIndex_(requiredHeader, normalizedHeaderIndexMap) {
+  var aliases = getHeaderAliases_(requiredHeader);
+  for (var i = 0; i < aliases.length; i += 1) {
+    var indexes = normalizedHeaderIndexMap[aliases[i]];
+    if (indexes && indexes.length > 0) {
+      return indexes[0];
+    }
+  }
+
+  if (requiredHeader === '氏名') {
+    var personalCodeIndexes = normalizedHeaderIndexMap[normalizeHeaderName_('個人コード')];
+    if (personalCodeIndexes && personalCodeIndexes.length >= 2) {
+      return personalCodeIndexes[1];
+    }
+  }
+
+  if (requiredHeader === '個人コード') {
+    var duplicatePersonalCodeIndexes = normalizedHeaderIndexMap[normalizeHeaderName_('個人コード')];
+    if (duplicatePersonalCodeIndexes && duplicatePersonalCodeIndexes.length >= 1) {
+      return duplicatePersonalCodeIndexes[0];
+    }
+  }
+
+  return null;
+}
+
+function normalizeText_(value) {
+  if (value === null || typeof value === 'undefined') {
+    return '';
+  }
+  var text = String(value).replace(/\uFEFF/g, '').replace(/[\u200B-\u200D\u2060]/g, '');
+  if (typeof text.normalize === 'function') {
+    text = text.normalize('NFKC');
+  }
+  return text.trim();
+}
+
+function normalizeHeaderName_(value) {
+  var text = normalizeText_(value);
+  if (!text) {
+    return '';
+  }
+
+  text = text.replace(/^["']+|["']+$/g, '');
+  return text.replace(/[\s\u3000]+/g, '');
+}
+
+function isBlankRow_(row) {
+  return row.every(function(cell) {
+    if (cell === null || typeof cell === 'undefined') {
+      return true;
+    }
+    if (typeof cell === 'string') {
+      return cell.trim() === '';
+    }
+    return cell === '';
+  });
+}
+
+function toNumber_(value) {
+  if (value === '' || value === null || typeof value === 'undefined') {
+    return null;
+  }
+
+  if (typeof value === 'number' && isFinite(value)) {
+    return value;
+  }
+
+  var text = normalizeText_(value).replace(/,/g, '');
+  if (!text) {
+    return null;
+  }
+
+  var numberValue = Number(text);
+  return isNaN(numberValue) ? null : numberValue;
+}
+
+function numericTimeToMinutes_(value) {
+  var absoluteValue = Math.abs(value);
+  if (absoluteValue < 1) {
+    return Math.round(value * 24 * 60);
+  }
+  if (absoluteValue <= 48) {
+    return Math.round(value * 60);
+  }
+  return Math.round(value);
+}
+
+function roundCurrency_(value) {
+  return Math.round(value * 100) / 100;
+}
